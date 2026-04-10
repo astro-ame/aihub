@@ -291,20 +291,33 @@ async def _navigate_to(
     """
     Плавный переход между разделами через редактирование существующего сообщения.
 
-    Логика:
-    - Если оба сообщения (текущее и новое) с фото → edit_media (меняем фото + caption).
-    - Если текущее с фото, новое без → edit_caption (оставляем фото, меняем текст).
-    - Если текущее без фото → edit_text.
-    - Если редактирование недоступно → fallback: удалить + отправить новое.
+    Логика (три уровня, каждый следующий — запасной):
+    1. edit_media  — меняем фото + caption одним запросом (оба с фото).
+    2. edit_caption / edit_text — обновляем только текст и кнопки (фото остаётся).
+    3. Fallback delete + send — только если оба предыдущих варианта упали.
     """
     chat_id = msg.chat.id
-    try:
-        if photo and _has_photo(msg):
+    has_photo = _has_photo(msg)
+
+    # ── Попытка 1: заменить медиа целиком ─────────────────────
+    if photo and has_photo:
+        try:
             await msg.edit_media(
                 InputMediaPhoto(media=photo, caption=text, parse_mode=parse_mode),
                 reply_markup=kb,
             )
-        elif _has_photo(msg):
+            return
+        except TelegramBadRequest as e:
+            err = (getattr(e, "message", None) or str(e) or "").lower()
+            if "message is not modified" in err:
+                return
+            logger.warning("_navigate_to edit_media failed, trying edit_caption: %s", e)
+        except Exception as e:
+            logger.warning("_navigate_to edit_media error, trying edit_caption: %s", e)
+
+    # ── Попытка 2: обновить только текст и кнопки (фото не трогаем) ──
+    try:
+        if has_photo:
             await msg.edit_caption(caption=text, parse_mode=parse_mode, reply_markup=kb)
         else:
             await msg.edit_text(text=text, parse_mode=parse_mode, reply_markup=kb)
@@ -313,11 +326,11 @@ async def _navigate_to(
         err = (getattr(e, "message", None) or str(e) or "").lower()
         if "message is not modified" in err:
             return
-        logger.warning("_navigate_to edit failed, fallback to delete+send: %s", e)
+        logger.warning("_navigate_to edit_caption/text failed, fallback to delete+send: %s", e)
     except Exception as e:
-        logger.warning("_navigate_to unexpected error, fallback: %s", e)
+        logger.warning("_navigate_to edit error, fallback to delete+send: %s", e)
 
-    # Fallback: удалить старое и отправить новое
+    # ── Fallback: удалить + отправить новое ───────────────────
     try:
         await msg.delete()
     except Exception:
@@ -881,14 +894,7 @@ async def catalog_product(callback: CallbackQuery) -> None:
         [InlineKeyboardButton(text="🛒 Купить", callback_data=f"catalog:buy:{product_id}:0")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data=f"catalog:list:{product['category']}")],
     ])
-    if product.get("image_file_id"):
-        try:
-            await callback.message.answer_photo(photo=product["image_file_id"], caption=text, parse_mode="Markdown", reply_markup=kb)
-            await callback.message.delete()
-        except Exception:
-            await _edit_or_caption(callback.message, text, kb)
-    else:
-        await _edit_or_caption(callback.message, text, kb)
+    await _navigate_to(callback.message, callback.bot, text, kb, product.get("image_file_id") or None)
 
 
 @router.callback_query(F.data == "catalog:email_cancel")
@@ -978,18 +984,7 @@ async def catalog_buy(callback: CallbackQuery, state: FSMContext) -> None:
         prompt_images = product.get("activation_prompt_images") or []
         # К сообщению с инструкцией прикрепляем изображение из инструкции (нижнее из добавленных в админке), а не картинку товара
         if prompt_images:
-            instruction_photo = prompt_images[-1]
-            try:
-                await callback.bot.send_photo(
-                    callback.message.chat.id,
-                    instruction_photo,
-                    caption=text,
-                    parse_mode="Markdown",
-                    reply_markup=kb_email,
-                )
-                await callback.message.delete()
-            except Exception:
-                await _edit_or_caption(callback.message, text, kb_email)
+            await _navigate_to(callback.message, callback.bot, text, kb_email, prompt_images[-1])
         else:
             await _edit_or_caption(callback.message, text, kb_email)
         return
@@ -1138,24 +1133,8 @@ async def catalog_pay(callback: CallbackQuery) -> None:
     ])
     instruction_images = product.get("instruction_images") or []
     if instruction_images:
-        # Фото инструкции — сверху, одним сообщением с текстом; карточку товара не показываем
-        try:
-            await callback.message.delete()
-        except Exception:
-            pass
-        try:
-            await callback.bot.send_photo(
-                callback.message.chat.id,
-                instruction_images[0],
-                caption=full_text,
-                parse_mode="Markdown",
-                reply_markup=kb,
-            )
-        except Exception as e:
-            logger.warning("Покупка с фото инструкции: %s", e)
-            await callback.bot.send_message(callback.message.chat.id, full_text, parse_mode="Markdown", reply_markup=kb)
+        await _navigate_to(callback.message, callback.bot, full_text, kb, instruction_images[0])
     else:
-        # Нет фото инструкции — оставляем карточку товара и редактируем подпись
         await _edit_or_caption(callback.message, full_text, kb)
 
 
@@ -1217,10 +1196,10 @@ async def catalog_email_confirm(callback: CallbackQuery, state: FSMContext) -> N
     if detail:
         lines[1:1] = [f"📦 **Товар:** {detail['product_name']}", f"💰 **Сумма заказа:** {detail['amount']} ₽", ""]
     manager_url = f"tg://user?id={config.SUPPORT_MANAGER_ID}"
-    await callback.message.edit_text(
+    await _edit_or_caption(
+        callback.message,
         "\n".join(lines),
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💬 Связаться с менеджером", url=manager_url)],
             [InlineKeyboardButton(text="◀️ В главное меню", callback_data="menu:main")],
         ]),
@@ -1243,9 +1222,10 @@ async def catalog_email_change(callback: CallbackQuery, state: FSMContext) -> No
     await safe_answer_callback(callback)
     await state.set_state(CatalogStates.waiting_email_order)
     await state.update_data(email_data_pending=None, email_pending=None, password_pending=None, twofa_pending=None)
-    await callback.message.edit_text(
+    await _edit_or_caption(
+        callback.message,
         "Отправьте ваши данные ещё раз. Формат: почта ; пароль ; 2FA (2FA необязательно).",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="◀️ Отмена", callback_data="catalog:email_cancel")],
         ]),
     )
