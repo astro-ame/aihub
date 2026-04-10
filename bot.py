@@ -29,46 +29,56 @@ import config
 import database as db
 
 
+# Кеш file_id для изображений разделов.
+# После первой отправки Telegram возвращает file_id — сохраняем его,
+# чтобы при edit_media не перезагружать файл каждый раз (надёжнее и быстрее).
+_photo_cache: dict[str, str] = {}
+
+
+def _get_cached_photo(key: str, path_attr: str, fallback=None):
+    """Вернуть file_id из кеша или FSInputFile для первой загрузки."""
+    if key in _photo_cache:
+        return _photo_cache[key]
+    path = getattr(config, path_attr, None)
+    if path and path.exists():
+        return FSInputFile(path)
+    return fallback
+
+
+def cache_photo(key: str, file_id: str) -> None:
+    """Сохранить file_id после успешной отправки/редактирования."""
+    if file_id:
+        _photo_cache[key] = file_id
+
+
 def _get_welcome_photo():
-    """Фото для главного меню: локальный файл data/main_menu.png или WELCOME_IMAGE_URL."""
-    if getattr(config, "MAIN_MENU_IMAGE_PATH", None) and config.MAIN_MENU_IMAGE_PATH.exists():
-        return FSInputFile(config.MAIN_MENU_IMAGE_PATH)
-    return config.WELCOME_IMAGE_URL
+    """Фото для главного меню."""
+    return _get_cached_photo("main", "MAIN_MENU_IMAGE_PATH", config.WELCOME_IMAGE_URL)
 
 
 def _get_avto_menu_photo():
-    """Фото для раздела «Автовыдача»: data/avto_menu.png или None (тогда только текст)."""
-    if getattr(config, "AVTO_MENU_IMAGE_PATH", None) and config.AVTO_MENU_IMAGE_PATH.exists():
-        return FSInputFile(config.AVTO_MENU_IMAGE_PATH)
-    return None
+    """Фото для раздела «Автовыдача»."""
+    return _get_cached_photo("avto", "AVTO_MENU_IMAGE_PATH")
 
 
 def _get_catalog_menu_photo():
-    """Фото для раздела «Все нейросети»: data/catalog_menu.png или None."""
-    if getattr(config, "CATALOG_MENU_IMAGE_PATH", None) and config.CATALOG_MENU_IMAGE_PATH.exists():
-        return FSInputFile(config.CATALOG_MENU_IMAGE_PATH)
-    return None
+    """Фото для раздела «Активации на почту»."""
+    return _get_cached_photo("catalog", "CATALOG_MENU_IMAGE_PATH")
 
 
 def _get_about_menu_photo():
-    """Фото для раздела «О боте»: data/about_menu.png или None."""
-    if getattr(config, "ABOUT_MENU_IMAGE_PATH", None) and config.ABOUT_MENU_IMAGE_PATH.exists():
-        return FSInputFile(config.ABOUT_MENU_IMAGE_PATH)
-    return None
+    """Фото для раздела «О боте»."""
+    return _get_cached_photo("about", "ABOUT_MENU_IMAGE_PATH")
 
 
 def _get_support_menu_photo():
-    """Фото для раздела «Поддержка»: data/support_menu.png или None."""
-    if getattr(config, "SUPPORT_MENU_IMAGE_PATH", None) and config.SUPPORT_MENU_IMAGE_PATH.exists():
-        return FSInputFile(config.SUPPORT_MENU_IMAGE_PATH)
-    return None
+    """Фото для раздела «Поддержка»."""
+    return _get_cached_photo("support", "SUPPORT_MENU_IMAGE_PATH")
 
 
 def _get_profile_menu_photo():
-    """Фото для раздела «Профиль»: data/profile_menu.png или None."""
-    if getattr(config, "PROFILE_MENU_IMAGE_PATH", None) and config.PROFILE_MENU_IMAGE_PATH.exists():
-        return FSInputFile(config.PROFILE_MENU_IMAGE_PATH)
-    return None
+    """Фото для раздела «Профиль»."""
+    return _get_cached_photo("profile", "PROFILE_MENU_IMAGE_PATH")
 from pally_client import create_payment_link, check_payment_status
 from utils_dt import format_created_at_moscow
 from admin_handlers import admin_router
@@ -287,6 +297,7 @@ async def _navigate_to(
     kb: InlineKeyboardMarkup,
     photo=None,
     parse_mode: str = "Markdown",
+    photo_key: str = "",
 ) -> None:
     """
     Плавный переход между разделами через редактирование существующего сообщения.
@@ -295,6 +306,8 @@ async def _navigate_to(
     1. edit_media  — меняем фото + caption одним запросом (оба с фото).
     2. edit_caption / edit_text — обновляем только текст и кнопки (фото остаётся).
     3. Fallback delete + send — только если оба предыдущих варианта упали.
+
+    photo_key — ключ раздела ("main", "profile", "avto" и т.д.) для кеширования file_id.
     """
     chat_id = msg.chat.id
     has_photo = _has_photo(msg)
@@ -302,10 +315,12 @@ async def _navigate_to(
     # ── Попытка 1: заменить медиа целиком ─────────────────────
     if photo and has_photo:
         try:
-            await msg.edit_media(
+            result = await msg.edit_media(
                 InputMediaPhoto(media=photo, caption=text, parse_mode=parse_mode),
                 reply_markup=kb,
             )
+            if photo_key and result and result.photo:
+                cache_photo(photo_key, result.photo[-1].file_id)
             return
         except TelegramBadRequest as e:
             err = (getattr(e, "message", None) or str(e) or "").lower()
@@ -330,14 +345,16 @@ async def _navigate_to(
     except Exception as e:
         logger.warning("_navigate_to edit error, fallback to delete+send: %s", e)
 
-    # ── Fallback: удалить + отправить новое ───────────────────
+    # ── Fallback: удалить + отправить новое (крайний случай) ──
     try:
         await msg.delete()
     except Exception:
         pass
     if photo:
         try:
-            await bot.send_photo(chat_id, photo=photo, caption=text, parse_mode=parse_mode, reply_markup=kb)
+            sent = await bot.send_photo(chat_id, photo=photo, caption=text, parse_mode=parse_mode, reply_markup=kb)
+            if photo_key and sent and sent.photo:
+                cache_photo(photo_key, sent.photo[-1].file_id)
             return
         except Exception as e:
             logger.warning("_navigate_to send_photo fallback failed: %s", e)
@@ -675,12 +692,14 @@ async def send_main_menu(message: Message) -> None:
     """Отправить главное меню с фото (при /start)."""
     kb = get_main_keyboard()
     try:
-        await message.answer_photo(
+        sent = await message.answer_photo(
             photo=_get_welcome_photo(),
             caption=WELCOME_TEXT,
             parse_mode="Markdown",
             reply_markup=kb,
         )
+        if sent and sent.photo:
+            cache_photo("main", sent.photo[-1].file_id)
     except Exception as e:
         logger.warning("Не удалось отправить фото: %s", e)
         await message.answer(WELCOME_TEXT, parse_mode="Markdown", reply_markup=kb)
@@ -690,7 +709,9 @@ async def _send_main_menu_photo(bot: Bot, chat_id: int, caption: str = WELCOME_T
     """Отправить главное меню с фото (без редактирования/удаления)."""
     kb = get_main_keyboard()
     try:
-        await bot.send_photo(chat_id, photo=_get_welcome_photo(), caption=caption, parse_mode="Markdown", reply_markup=kb)
+        sent = await bot.send_photo(chat_id, photo=_get_welcome_photo(), caption=caption, parse_mode="Markdown", reply_markup=kb)
+        if sent and sent.photo:
+            cache_photo("main", sent.photo[-1].file_id)
     except Exception as e:
         logger.warning("Главное меню с фото: %s", e)
         await bot.send_message(chat_id, caption, parse_mode="Markdown", reply_markup=kb)
@@ -699,7 +720,7 @@ async def _send_main_menu_photo(bot: Bot, chat_id: int, caption: str = WELCOME_T
 async def _show_main_menu_with_photo(bot: Bot, chat_id: int, message: Message | None = None) -> None:
     """Показать главное меню: редактируем существующее сообщение (плавный переход), fallback — отправляем новое."""
     if message:
-        await _navigate_to(message, bot, WELCOME_TEXT, get_main_keyboard(), _get_welcome_photo())
+        await _navigate_to(message, bot, WELCOME_TEXT, get_main_keyboard(), _get_welcome_photo(), photo_key="main")
     else:
         await _send_main_menu_photo(bot, chat_id)
 
@@ -750,7 +771,7 @@ async def menu_callback(callback: CallbackQuery) -> None:
             callback.from_user.username if callback.from_user else None,
         )
         kb = get_profile_keyboard()
-        await _navigate_to(msg, callback.bot, text, kb, _get_profile_menu_photo())
+        await _navigate_to(msg, callback.bot, text, kb, _get_profile_menu_photo(), photo_key="profile")
         return
 
     if action == "avto":
@@ -765,7 +786,7 @@ async def menu_callback(callback: CallbackQuery) -> None:
             "Выберите нужную подписку ниже и получите доступ в пару шагов.\n\n"
             "AI Hub работает быстро — чтобы вы работали ещё быстрее 🚀"
         )
-        await _navigate_to(msg, callback.bot, text, _catalog_keyboard("avto"), _get_avto_menu_photo())
+        await _navigate_to(msg, callback.bot, text, _catalog_keyboard("avto"), _get_avto_menu_photo(), photo_key="avto")
         return
     if action == "catalog":
         text = (
@@ -778,7 +799,7 @@ async def menu_callback(callback: CallbackQuery) -> None:
             "Выбирайте нужную нейросеть ниже и подключайте удобным способом.\n\n"
             "AI Hub — один каталог, все возможности 🚀"
         )
-        await _navigate_to(msg, callback.bot, text, _catalog_keyboard("neural"), _get_catalog_menu_photo())
+        await _navigate_to(msg, callback.bot, text, _catalog_keyboard("neural"), _get_catalog_menu_photo(), photo_key="catalog")
         return
     if action == "support":
         text = f"💬 **Поддержка AI Hub**\n\n{SUPPORT_INTRO}"
@@ -793,13 +814,13 @@ async def menu_callback(callback: CallbackQuery) -> None:
         rows.append([InlineKeyboardButton(text="💬 Связаться с менеджером", url=MANAGER_URL)])
         rows.append([InlineKeyboardButton(text="◀️ Назад в главное меню", callback_data="menu:main")])
         kb = InlineKeyboardMarkup(inline_keyboard=rows)
-        await _navigate_to(msg, callback.bot, text, kb, _get_support_menu_photo())
+        await _navigate_to(msg, callback.bot, text, kb, _get_support_menu_photo(), photo_key="support")
         return
     if action == "about":
         kb_back = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="◀️ Назад в главное меню", callback_data="menu:main")],
         ])
-        await _navigate_to(msg, callback.bot, ABOUT_BOT_TEXT, kb_back, _get_about_menu_photo())
+        await _navigate_to(msg, callback.bot, ABOUT_BOT_TEXT, kb_back, _get_about_menu_photo(), photo_key="about")
         return
 
 
@@ -1300,10 +1321,10 @@ async def profile_purchases(callback: CallbackQuery) -> None:
     nav = []
     if page > 1:
         nav.append(InlineKeyboardButton(text="◀ Назад", callback_data=f"profile:purchases:{page - 1}"))
-    nav.append(InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu:main"))
     if page < total_pages:
         nav.append(InlineKeyboardButton(text="Далее ▶", callback_data=f"profile:purchases:{page + 1}"))
-    rows.append(nav)
+    if nav:
+        rows.append(nav)
     rows.append([InlineKeyboardButton(text="◀️ Назад в профиль", callback_data="profile:main")])
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
     await _edit_or_caption(callback.message, text, kb)
@@ -1393,6 +1414,7 @@ async def profile_balance(callback: CallbackQuery) -> None:
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="balance:topup")],
+        [InlineKeyboardButton(text="◀️ Назад в профиль", callback_data="profile:main")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu:main")],
     ])
     await _edit_or_caption(callback.message, text, kb)
@@ -1569,7 +1591,7 @@ async def profile_promo(callback: CallbackQuery, state: FSMContext) -> None:
         "Введите его ниже и заберите своё."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="profile:promo_back")],
+        [InlineKeyboardButton(text="◀️ Назад в профиль", callback_data="profile:promo_back")],
     ])
     await _edit_or_caption(callback.message, text, kb)
 
@@ -1598,7 +1620,7 @@ async def apply_promocode(message: Message, state: FSMContext) -> None:
     except Exception:
         pass
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="profile:promo_back")],
+        [InlineKeyboardButton(text="◀️ Назад в профиль", callback_data="profile:promo_back")],
     ])
     if ok:
         text = f"✅ Промокод принят! На ваш баланс зачислено **{bonus}** ₽."
