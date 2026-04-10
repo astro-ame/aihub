@@ -15,7 +15,6 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     FSInputFile,
-    InputMediaPhoto,
 )
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -276,57 +275,6 @@ async def _edit_or_caption(msg: Message, text: str, reply_markup: InlineKeyboard
         await msg.edit_caption(caption=text, **kwargs)
     else:
         await msg.edit_text(text=text, **kwargs)
-
-
-async def _navigate_to(
-    msg: Message,
-    bot: Bot,
-    text: str,
-    kb: InlineKeyboardMarkup,
-    photo=None,
-    parse_mode: str = "Markdown",
-) -> None:
-    """
-    Плавный переход между разделами через редактирование существующего сообщения.
-
-    Логика:
-    - Если оба сообщения (текущее и новое) с фото → edit_media (меняем фото + caption).
-    - Если текущее с фото, новое без → edit_caption (оставляем фото, меняем текст).
-    - Если текущее без фото → edit_text.
-    - Если редактирование недоступно → fallback: удалить + отправить новое.
-    """
-    chat_id = msg.chat.id
-    try:
-        if photo and _has_photo(msg):
-            await msg.edit_media(
-                InputMediaPhoto(media=photo, caption=text, parse_mode=parse_mode),
-                reply_markup=kb,
-            )
-        elif _has_photo(msg):
-            await msg.edit_caption(caption=text, parse_mode=parse_mode, reply_markup=kb)
-        else:
-            await msg.edit_text(text=text, parse_mode=parse_mode, reply_markup=kb)
-        return
-    except TelegramBadRequest as e:
-        err = (getattr(e, "message", None) or str(e) or "").lower()
-        if "message is not modified" in err:
-            return
-        logger.warning("_navigate_to edit failed, fallback to delete+send: %s", e)
-    except Exception as e:
-        logger.warning("_navigate_to unexpected error, fallback: %s", e)
-
-    # Fallback: удалить старое и отправить новое
-    try:
-        await msg.delete()
-    except Exception:
-        pass
-    if photo:
-        try:
-            await bot.send_photo(chat_id, photo=photo, caption=text, parse_mode=parse_mode, reply_markup=kb)
-            return
-        except Exception as e:
-            logger.warning("_navigate_to send_photo fallback failed: %s", e)
-    await bot.send_message(chat_id, text, parse_mode=parse_mode, reply_markup=kb)
 
 
 def _client_line(user_id: int, username: str | None) -> str:
@@ -682,11 +630,13 @@ async def _send_main_menu_photo(bot: Bot, chat_id: int, caption: str = WELCOME_T
 
 
 async def _show_main_menu_with_photo(bot: Bot, chat_id: int, message: Message | None = None) -> None:
-    """Показать главное меню: редактируем существующее сообщение (плавный переход), fallback — отправляем новое."""
+    """Показать главное меню с изображением главного меню: всегда удаляем текущее сообщение и отправляем новое с фото главного меню."""
     if message:
-        await _navigate_to(message, bot, WELCOME_TEXT, get_main_keyboard(), _get_welcome_photo())
-    else:
-        await _send_main_menu_photo(bot, chat_id)
+        try:
+            await message.delete()
+        except Exception:
+            pass
+    await _send_main_menu_photo(bot, chat_id)
 
 
 @router.message(Command("start"))
@@ -711,6 +661,7 @@ async def menu_callback(callback: CallbackQuery) -> None:
     action = callback.data.split(":", 1)[1]
     await safe_answer_callback(callback)
     msg = callback.message
+    has_photo = _has_photo(msg)
 
     if action == "main":
         await _show_main_menu_with_photo(callback.bot, msg.chat.id, msg)
@@ -735,7 +686,25 @@ async def menu_callback(callback: CallbackQuery) -> None:
             callback.from_user.username if callback.from_user else None,
         )
         kb = get_profile_keyboard()
-        await _navigate_to(msg, callback.bot, text, kb, _get_profile_menu_photo())
+        photo = _get_profile_menu_photo()
+        if photo:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            try:
+                await callback.bot.send_photo(
+                    msg.chat.id,
+                    photo=photo,
+                    caption=text,
+                    parse_mode="Markdown",
+                    reply_markup=kb,
+                )
+            except Exception as e:
+                logger.warning("Профиль с фото: %s", e)
+                await callback.bot.send_message(msg.chat.id, text, parse_mode="Markdown", reply_markup=kb)
+        else:
+            await _edit_or_caption(msg, text, kb)
         return
 
     if action == "avto":
@@ -750,7 +719,25 @@ async def menu_callback(callback: CallbackQuery) -> None:
             "Выберите нужную подписку ниже и получите доступ в пару шагов.\n\n"
             "AI Hub работает быстро — чтобы вы работали ещё быстрее 🚀"
         )
-        await _navigate_to(msg, callback.bot, text, _catalog_keyboard("avto"), _get_avto_menu_photo())
+        photo = _get_avto_menu_photo()
+        if photo:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            try:
+                await callback.bot.send_photo(
+                    msg.chat.id,
+                    photo=photo,
+                    caption=text,
+                    parse_mode="Markdown",
+                    reply_markup=_catalog_keyboard("avto"),
+                )
+            except Exception as e:
+                logger.warning("Автовыдача с фото: %s", e)
+                await callback.bot.send_message(msg.chat.id, text, parse_mode="Markdown", reply_markup=_catalog_keyboard("avto"))
+        else:
+            await _edit_or_caption(msg, text, _catalog_keyboard("avto"))
         return
     if action == "catalog":
         text = (
@@ -763,7 +750,25 @@ async def menu_callback(callback: CallbackQuery) -> None:
             "Выбирайте нужную нейросеть ниже и подключайте удобным способом.\n\n"
             "AI Hub — один каталог, все возможности 🚀"
         )
-        await _navigate_to(msg, callback.bot, text, _catalog_keyboard("neural"), _get_catalog_menu_photo())
+        photo = _get_catalog_menu_photo()
+        if photo:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            try:
+                await callback.bot.send_photo(
+                    msg.chat.id,
+                    photo=photo,
+                    caption=text,
+                    parse_mode="Markdown",
+                    reply_markup=_catalog_keyboard("neural"),
+                )
+            except Exception as e:
+                logger.warning("Активации на почту с фото: %s", e)
+                await callback.bot.send_message(msg.chat.id, text, parse_mode="Markdown", reply_markup=_catalog_keyboard("neural"))
+        else:
+            await _edit_or_caption(msg, text, _catalog_keyboard("neural"))
         return
     if action == "support":
         text = f"💬 **Поддержка AI Hub**\n\n{SUPPORT_INTRO}"
@@ -778,13 +783,49 @@ async def menu_callback(callback: CallbackQuery) -> None:
         rows.append([InlineKeyboardButton(text="💬 Связаться с менеджером", url=MANAGER_URL)])
         rows.append([InlineKeyboardButton(text="◀️ Назад в главное меню", callback_data="menu:main")])
         kb = InlineKeyboardMarkup(inline_keyboard=rows)
-        await _navigate_to(msg, callback.bot, text, kb, _get_support_menu_photo())
+        photo = _get_support_menu_photo()
+        if photo:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            try:
+                await callback.bot.send_photo(
+                    msg.chat.id,
+                    photo=photo,
+                    caption=text,
+                    parse_mode="Markdown",
+                    reply_markup=kb,
+                )
+            except Exception as e:
+                logger.warning("Поддержка с фото: %s", e)
+                await callback.bot.send_message(msg.chat.id, text, parse_mode="Markdown", reply_markup=kb)
+        else:
+            await _edit_or_caption(msg, text, kb)
         return
     if action == "about":
         kb_back = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="◀️ Назад в главное меню", callback_data="menu:main")],
         ])
-        await _navigate_to(msg, callback.bot, ABOUT_BOT_TEXT, kb_back, _get_about_menu_photo())
+        photo = _get_about_menu_photo()
+        if photo:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            try:
+                await callback.bot.send_photo(
+                    msg.chat.id,
+                    photo=photo,
+                    caption=ABOUT_BOT_TEXT,
+                    parse_mode="Markdown",
+                    reply_markup=kb_back,
+                )
+            except Exception as e:
+                logger.warning("О боте с фото: %s", e)
+                await callback.bot.send_message(msg.chat.id, ABOUT_BOT_TEXT, parse_mode="Markdown", reply_markup=kb_back)
+        else:
+            await _edit_or_caption(msg, ABOUT_BOT_TEXT, kb_back)
         return
 
 
